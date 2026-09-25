@@ -1,1 +1,147 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>批次放行</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>药品生产偏差与批次放行</h1><p>偏差、检验、返工、供应商变更和稳定性数据共同约束质量放行。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>批次放行复核台</title>
+<style>
+  :root {
+    --bg:#f4f6f8; --card:#fff; --ink:#1f2933; --muted:#697586; --line:#e3e8ee;
+    --red:#c9372c; --red-bg:#fdecea; --amber:#b25e09; --amber-bg:#fdf3e0;
+    --green:#1e7e44; --green-bg:#e7f6ee; --blue:#2b59c3; --blue-bg:#eaf1fe;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.55 "PingFang SC","Microsoft YaHei",system-ui,sans-serif; background:var(--bg); color:var(--ink); }
+  header.top { background:#10243e; color:#fff; padding:14px 24px; display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+  header.top h1 { font-size:18px; margin:0; font-weight:600; }
+  header.top .sub { color:#aebfd4; font-size:12px; }
+  .bar { background:var(--card); border-bottom:1px solid var(--line); padding:10px 24px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; position:sticky; top:0; z-index:5; }
+  .bar .spacer { flex:1; }
+  button, select, input { font:inherit; }
+  button { border:1px solid #c3ccd6; background:#fff; color:var(--ink); border-radius:6px; padding:6px 12px; cursor:pointer; }
+  button:hover { border-color:#8b99a7; }
+  button.primary { background:var(--blue); border-color:var(--blue); color:#fff; }
+  button.danger { background:var(--red); border-color:var(--red); color:#fff; }
+  button.ghost { border-color:transparent; background:transparent; color:var(--blue); padding:4px 8px; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .tabs button { border-radius:999px; padding:5px 14px; font-size:13px; }
+  .tabs button.on { background:#10243e; border-color:#10243e; color:#fff; }
+  main { max-width:1280px; margin:18px auto; padding:0 24px 60px; }
+  .stats { display:flex; gap:10px; margin-bottom:14px; flex-wrap:wrap; }
+  .stat { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:8px 14px; font-size:12px; color:var(--muted); }
+  .stat b { display:block; font-size:20px; color:var(--ink); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; margin-bottom:12px; overflow:hidden; }
+  .card.s-v-blocked { border-left:4px solid var(--red); }
+  .card.s-v-conditional { border-left:4px solid var(--amber); }
+  .card.s-v-ready { border-left:4px solid var(--green); }
+  .card-head { display:flex; gap:14px; align-items:center; padding:12px 16px; cursor:pointer; }
+  .card-head:hover { background:#fafbfc; }
+  .card-head .no { font-weight:600; font-size:15px; min-width:110px; }
+  .card-head .meta { color:var(--muted); font-size:12px; flex:1; }
+  .badge { display:inline-block; border-radius:999px; padding:2px 10px; font-size:12px; font-weight:600; white-space:nowrap; }
+  .b-blocked { background:var(--red-bg); color:var(--red); }
+  .b-conditional { background:var(--amber-bg); color:var(--amber); }
+  .b-ready { background:var(--green-bg); color:var(--green); }
+  .b-state { background:#eef1f4; color:#475467; font-weight:500; }
+  .b-review-stale { background:#f2e9fd; color:#6a3bb5; }
+  .chev { color:var(--muted); transition:transform .15s; }
+  .card.open .chev { transform:rotate(90deg); }
+  .card-body { display:none; border-top:1px solid var(--line); padding:14px 16px; }
+  .card.open .card-body { display:block; }
+  .review-strip { border-radius:8px; padding:8px 12px; margin-bottom:12px; font-size:13px; display:flex; gap:10px; align-items:center; }
+  .review-strip.ok { background:var(--green-bg); color:var(--green); }
+  .review-strip.stale { background:#f2e9fd; color:#6a3bb5; }
+  .review-strip.none { background:#f2f4f7; color:var(--muted); }
+  .review-strip .grow { flex:1; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  @media (max-width:900px){ .grid { grid-template-columns:1fr; } }
+  h4.sec { margin:14px 0 6px; font-size:13px; color:var(--muted); letter-spacing:.04em; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  th, td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:500; }
+  td.fail, .pill-fail { color:var(--red); font-weight:600; }
+  td.pass { color:var(--green); }
+  .missing { list-style:none; margin:0 0 6px; padding:0; }
+  .missing li { display:flex; gap:10px; padding:8px 10px; border-radius:8px; margin-bottom:6px; align-items:flex-start; }
+  .missing li.cat-deviation { background:var(--red-bg); }
+  .missing li.cat-test { background:#fef6e6; }
+  .missing li.cat-rework { background:#fef6e6; }
+  .missing li.cat-supplier { background:#eaf1fe; }
+  .missing li.cat-stability { background:var(--red-bg); }
+  .missing li.warning { background:#f2f4f7; color:var(--muted); }
+  .missing .ic { font-weight:700; }
+  .missing .txt { flex:1; }
+  .missing .txt small { display:block; color:var(--muted); }
+  .missing .acts { white-space:nowrap; }
+  .mini { padding:3px 9px; font-size:12px; }
+  .close-note { background:#fff8ec; border:1px solid #f0d9a8; color:var(--amber); border-radius:6px; padding:6px 10px; font-size:12px; margin:4px 0 8px; }
+  .hist details { margin-top:6px; }
+  .hist summary { cursor:pointer; color:var(--blue); font-size:12.5px; }
+  .hist .old { border-left:3px solid var(--line); padding:6px 10px; margin:6px 0; color:var(--muted); font-size:12.5px; background:#fafbfc; border-radius:0 6px 6px 0; }
+  .hist .old b { color:#6a3bb5; font-weight:600; }
+  .actions-row { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; padding-top:12px; border-top:1px dashed var(--line); }
+  dialog { border:1px solid var(--line); border-radius:12px; padding:0; width:min(560px,94vw); }
+  dialog::backdrop { background:rgba(16,36,62,.45); }
+  .dlg-head { padding:14px 18px; border-bottom:1px solid var(--line); font-weight:600; }
+  .dlg-body { padding:14px 18px; display:grid; gap:10px; }
+  .dlg-body label { font-size:12.5px; color:var(--muted); display:grid; gap:4px; }
+  .dlg-body input, .dlg-body select, .dlg-body textarea { width:100%; padding:7px 9px; border:1px solid #c3ccd6; border-radius:6px; }
+  .dlg-foot { padding:12px 18px; border-top:1px solid var(--line); display:flex; justify-content:flex-end; gap:8px; background:#fafbfc; }
+  .toast { position:fixed; right:20px; bottom:20px; max-width:420px; z-index:50; display:grid; gap:8px; }
+  .toast div { padding:10px 14px; border-radius:8px; color:#fff; box-shadow:0 4px 14px rgba(0,0,0,.18); font-size:13px; }
+  .toast .ok { background:var(--green); } .toast .err { background:var(--red); }
+  .empty { text-align:center; color:var(--muted); padding:50px 0; }
+  .hint { font-size:12px; color:var(--muted); }
+  code.rev { background:#eef1f4; padding:1px 6px; border-radius:4px; }
+</style>
+</head>
+<body>
+<header class="top">
+  <h1>批次放行复核台</h1>
+  <span class="sub">每批一张待办：未关闭偏差 · 最新检验 · 稳定性 · 供应商变更 · 返工</span>
+</header>
+<div class="bar">
+  <div class="tabs" id="tabs">
+    <button data-v="" class="on">全部</button>
+    <button data-v="blocked">🚫 卡住</button>
+    <button data-v="conditional">⚠️ 可有条件放行</button>
+    <button data-v="ready">✅ 可放行</button>
+  </div>
+  <select id="f-status">
+    <option value="">全部状态</option>
+    <option value="manufactured">已生产</option>
+    <option value="investigation">调查中</option>
+    <option value="awaiting_resample">待再取样</option>
+    <option value="conditional">有条件放行</option>
+    <option value="released">已放行</option>
+    <option value="rejected">已拒绝</option>
+  </select>
+  <input id="f-product" placeholder="按产品名筛选" style="padding:6px 9px;border:1px solid #c3ccd6;border-radius:6px">
+  <span class="spacer"></span>
+  <span class="hint">身份</span>
+  <select id="actor">
+    <option value="qa:qa-demo">QA（qa-demo）</option>
+    <option value="lab:lab-demo">化验室（lab-demo）</option>
+    <option value="inspector:inspector-demo">巡检（inspector-demo）</option>
+    <option value="operator:operator-demo">操作员（operator-demo）</option>
+  </select>
+  <button onclick="load()">刷新</button>
+  <button class="primary" onclick="openForm('create')">登记批次</button>
+</div>
+<main>
+  <div class="stats" id="stats"></div>
+  <div id="list">加载中…</div>
+</main>
+
+<dialog id="dlg">
+  <div class="dlg-head" id="dlg-title"></div>
+  <div class="dlg-body" id="dlg-body"></div>
+  <div class="dlg-foot">
+    <button onclick="dlg.close()">取消</button>
+    <button class="primary" id="dlg-ok">提交</button>
+  </div>
+</dialog>
+<div class="toast" id="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
