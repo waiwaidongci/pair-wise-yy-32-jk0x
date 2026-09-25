@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
-"""Pharmaceutical batch deviation, rework and release decision service."""
+"""药品批次放行复核服务：记录层（存储、角色、审计、HTTP 接口）。
+
+规则、记录、页面分离：复核规则见 rules.py，复核台页面见 static/index.html。
+"""
 from __future__ import annotations
 
 import argparse
 import json
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+import rules
+
 DB_PATH = Path(__file__).with_name("data.db")
+TERMINAL_STATES = {"released", "rejected"}
 
 
 def now() -> str:
@@ -74,6 +80,8 @@ class Store:
         CREATE TABLE IF NOT EXISTS supplier_changes (
           id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id INTEGER NOT NULL REFERENCES batches(id),
           supplier TEXT NOT NULL, change_type TEXT NOT NULL, description TEXT NOT NULL,
+          disposition TEXT CHECK(disposition IN ('no_impact','acceptable','unacceptable')),
+          disposition_note TEXT, disposition_by TEXT, disposition_at TEXT,
           recorded_by TEXT NOT NULL, created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS stability (
@@ -86,12 +94,25 @@ class Store:
           decision TEXT NOT NULL CHECK(decision IN ('release','reject','conditional','resample')), rationale TEXT NOT NULL,
           exception_code TEXT, decided_by TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(batch_id,revision)
         );
+        CREATE TABLE IF NOT EXISTS reviews (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id INTEGER NOT NULL REFERENCES batches(id),
+          revision INTEGER NOT NULL, outcome TEXT NOT NULL, checklist_json TEXT NOT NULL,
+          created_at TEXT NOT NULL, superseded INTEGER NOT NULL DEFAULT 0
+        );
         CREATE TABLE IF NOT EXISTS audit_log (
           id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
           entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, details_json TEXT NOT NULL
         );
         """)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """老库补齐供应商变更的影响处置字段。"""
+        cols = {row[1] for row in self.conn.execute("PRAGMA table_info(supplier_changes)")}
+        for col in ("disposition", "disposition_note", "disposition_by", "disposition_at"):
+            if col not in cols:
+                self.conn.execute(f"ALTER TABLE supplier_changes ADD COLUMN {col} TEXT")
 
     def audit(self, actor: str, action: str, entity_type: str, entity_id: object, details: dict) -> None:
         self.conn.execute("INSERT INTO audit_log(at,actor,action,entity_type,entity_id,details_json) VALUES(?,?,?,?,?,?)",
@@ -121,6 +142,30 @@ class BatchService:
         if batch is not None and int(batch["factory_id"]) != int(factory_id):
             raise ApiError(403, "不能修改其他工厂的批次")
 
+    # ---- 复核：由 rules 模块按当前记录实时计算，并随每次资料变更留存版本快照 ----
+
+    def _records(self, batch_id: int) -> dict:
+        def rows(name: str) -> list[dict]:
+            return [dict(r) for r in self.conn.execute(f"SELECT * FROM {name} WHERE batch_id=? ORDER BY id", (batch_id,))]
+        return {"deviations": rows("deviations"), "tests": rows("tests"), "rework": rows("rework"),
+                "supplier_changes": rows("supplier_changes"), "stability": rows("stability")}
+
+    def _current_review(self, batch_id: int) -> dict:
+        batch = self._batch_dict(self._row("batches", batch_id))
+        rec = self._records(batch_id)
+        items = rules.build_checklist(batch, rec["deviations"], rec["tests"], rec["rework"],
+                                      rec["supplier_changes"], rec["stability"])
+        return {"batch_id": batch_id, "revision": batch["revision"], "items": items, **rules.summarize(items)}
+
+    def _refresh_review(self, batch_id: int) -> None:
+        """资料一改，原复核失效（superseded=1），按新版本重算并留存快照，旧结论仍可查。"""
+        review = self._current_review(batch_id)
+        self.conn.execute("UPDATE reviews SET superseded=1 WHERE batch_id=? AND superseded=0", (batch_id,))
+        self.conn.execute("INSERT INTO reviews(batch_id,revision,outcome,checklist_json,created_at,superseded) VALUES(?,?,?,?,?,0)",
+                          (batch_id, review["revision"], review["outcome"], j(review["items"]), now()))
+
+    # ---- 登记 ----
+
     def register_factory(self, actor: str | None, role: str | None, code: str, name: str, country: str) -> dict:
         actor = self._actor(actor, role, {"qa"})
         if not code or not name: raise ApiError(400, "工厂代号和名称不能为空")
@@ -142,6 +187,7 @@ class BatchService:
                                          VALUES(?,?,?,?,?, 'manufactured',?,?,?)""",
                                         (factory_id, batch_no, product, mfg_date, expiry_date, actor, stamp, stamp))
                 self.store.audit(actor, "batch.create", "batch", cur.lastrowid, {"factory_id": factory_id, "batch_no": batch_no})
+                self._refresh_review(cur.lastrowid)
         except sqlite3.IntegrityError as exc: raise ApiError(409, "该工厂批号已存在") from exc
         return self._batch_dict(self._row("batches", cur.lastrowid))
 
@@ -149,7 +195,7 @@ class BatchService:
         actor = self._actor(actor, role, {"operator", "inspector"})
         batch = self._row("batches", batch_id); self._factory_check(actor, factory_id, batch)
         if severity not in {"critical", "minor"} or not title.strip(): raise ApiError(400, "偏差等级或描述不合法")
-        if batch["state"] in {"released", "rejected"}: raise ApiError(409, "已终态批次不能新增偏差")
+        if batch["state"] in TERMINAL_STATES: raise ApiError(409, "已终态批次不能新增偏差")
         with self.conn:
             cur = self.conn.execute("""INSERT INTO deviations(batch_id,severity,title,due_at,status,created_by,created_at)
                                      VALUES(?,?,?,?,'open',?,?)""", (batch_id, severity, title, due_at, actor, now()))
@@ -162,6 +208,9 @@ class BatchService:
         deviation = self._row("deviations", deviation_id); batch = self._row("batches", deviation["batch_id"])
         if deviation["status"] != "open": raise ApiError(409, "偏差已经关闭")
         if not corrective_action.strip(): raise ApiError(400, "必须填写纠正措施")
+        rec = self._records(batch["id"])
+        blockers = rules.deviation_close_blockers(rec["tests"], rec["rework"])
+        if blockers: raise ApiError(409, "；".join(blockers))
         with self.conn:
             self.conn.execute("UPDATE deviations SET status='closed',corrective_action=?,closed_by=?,closed_at=? WHERE id=? AND status='open'",
                               (corrective_action, actor, now(), deviation_id))
@@ -184,7 +233,7 @@ class BatchService:
         actor = self._actor(actor, role, {"lab"})
         batch = self._row("batches", batch_id); self._factory_check(actor, factory_id, batch)
         if not test_type.strip() or spec_min > spec_max: raise ApiError(400, "检验项目或标准不合法")
-        if batch["state"] in {"released", "rejected"}: raise ApiError(409, "终态批次不能补录检验")
+        if batch["state"] in TERMINAL_STATES: raise ApiError(409, "终态批次不能补录检验")
         round_no = self.conn.execute("SELECT COALESCE(MAX(round),0)+1 FROM tests WHERE batch_id=? AND test_type=?", (batch_id, test_type)).fetchone()[0]
         passed = int(spec_min <= result <= spec_max)
         with self.conn:
@@ -197,7 +246,7 @@ class BatchService:
     def plan_rework(self, actor: str | None, role: str | None, factory_id: int, batch_id: int, description: str, expected_revision: int) -> dict:
         actor = self._actor(actor, role, {"operator"})
         batch = self._row("batches", batch_id); self._factory_check(actor, factory_id, batch)
-        if batch["state"] in {"released", "rejected"}: raise ApiError(409, "终态批次不能返工")
+        if batch["state"] in TERMINAL_STATES: raise ApiError(409, "终态批次不能返工")
         with self.conn:
             cur = self.conn.execute("INSERT INTO rework(batch_id,description,status,created_by,created_at) VALUES(?,?,'planned',?,?)", (batch_id, description, actor, now()))
             self._advance_batch(batch_id, expected_revision, "investigation")
@@ -224,6 +273,19 @@ class BatchService:
             self.store.audit(actor, "supplier_change.record", "batch", batch_id, {"supplier": supplier, "change_type": change_type})
         return dict(self._row("supplier_changes", cur.lastrowid))
 
+    def disposition_supplier_change(self, actor: str | None, role: str | None, change_id: int, disposition: str, note: str, expected_revision: int) -> dict:
+        """供应商变更的影响处置；未处置的变更会一直留在批次待办上。"""
+        actor = self._actor(actor, role, {"qa"})
+        row = self._row("supplier_changes", change_id); batch = self._row("batches", row["batch_id"])
+        if disposition not in {"no_impact", "acceptable", "unacceptable"}: raise ApiError(400, "影响处置结论不合法")
+        if disposition != "no_impact" and not note.strip(): raise ApiError(400, "必须填写影响处置说明")
+        with self.conn:
+            self.conn.execute("UPDATE supplier_changes SET disposition=?,disposition_note=?,disposition_by=?,disposition_at=? WHERE id=?",
+                              (disposition, note, actor, now(), change_id))
+            self._advance_batch(batch["id"], expected_revision, batch["state"])
+            self.store.audit(actor, "supplier_change.disposition", "supplier_change", change_id, {"batch_id": batch["id"], "disposition": disposition})
+        return dict(self._row("supplier_changes", change_id))
+
     def record_stability(self, actor: str | None, role: str | None, factory_id: int, batch_id: int, condition: str, timepoint: str, result: float, spec_limit: float, expected_revision: int) -> dict:
         actor = self._actor(actor, role, {"lab"})
         batch = self._row("batches", batch_id); self._factory_check(actor, factory_id, batch)
@@ -235,62 +297,58 @@ class BatchService:
             self.store.audit(actor, "stability.record", "batch", batch_id, {"condition": condition, "timepoint": timepoint, "passed": bool(passed)})
         return dict(self._row("stability", cur.lastrowid))
 
+    # ---- 放行决定：以 rules 的当前复核结论为准 ----
+
     def decide(self, actor: str | None, role: str | None, batch_id: int, decision: str, rationale: str, expected_revision: int, exception_code: str = "") -> dict:
         actor = self._actor(actor, role, {"qa"})
         batch = self._row("batches", batch_id)
         if decision not in {"release", "reject", "conditional", "resample"}: raise ApiError(400, "放行决定不合法")
-        if batch["state"] in {"released", "rejected"}: raise ApiError(409, "批次已经是终态")
+        if batch["state"] in TERMINAL_STATES: raise ApiError(409, "批次已经是终态")
         if int(expected_revision) != int(batch["revision"]): raise ApiError(409, "批次已被其他工厂或质量人员修改，请刷新版本")
         if not rationale.strip(): raise ApiError(400, "必须填写决定依据")
-        deviations = self.conn.execute("SELECT * FROM deviations WHERE batch_id=? ORDER BY id", (batch_id,)).fetchall()
-        open_deviations = [d for d in deviations if d["status"] == "open"]
-        latest_tests: dict[str, sqlite3.Row] = {}
-        for row in self.conn.execute("SELECT * FROM tests WHERE batch_id=? ORDER BY id", (batch_id,)):
-            latest_tests[row["test_type"]] = row
-        if decision in {"release", "conditional"} and not latest_tests:
-            raise ApiError(409, "放行前至少需要一项检验结果")
-        if decision in {"release", "conditional"} and any(not row["passed"] for row in latest_tests.values()):
-            raise ApiError(409, "最新检验结果仍有不合格项")
+        review = self._current_review(batch_id)
         if decision == "resample":
             if batch["state"] == "conditional": raise ApiError(409, "有条件放行后不能直接改为再取样")
             new_state = "awaiting_resample"
         elif decision == "reject":
             new_state = "rejected"
-        elif any(d["severity"] == "critical" for d in open_deviations):
-            raise ApiError(409, "未关闭的关键偏差阻止放行")
-        elif decision == "release" and open_deviations:
-            raise ApiError(409, "仍有未关闭偏差，不能正式放行")
-        elif decision == "conditional":
-            for deviation in open_deviations:
-                if not deviation["exception_reason"] or not after_now(deviation["exception_until"]):
-                    raise ApiError(409, f"偏差 {deviation['id']} 没有有效例外批准")
+        elif decision == "release":
+            if not review["can_release"]:
+                raise ApiError(409, "复核未通过，不能正式放行：" + "；".join(review["missing"]))
+            new_state = "released"
+        else:
+            if not review["can_conditional"]:
+                reason = "；".join(review["missing"]) if review["missing"] else "当前没有需要例外覆盖的事项，可直接正式放行"
+                raise ApiError(409, "复核未通过，不能有条件放行：" + reason)
             if not exception_code.strip(): raise ApiError(400, "有条件放行必须提供例外编号")
             new_state = "conditional"
-        else:
-            new_state = "released"
         with self.conn:
             cur = self.conn.execute("""INSERT INTO decisions(batch_id,revision,decision,rationale,exception_code,decided_by,created_at)
                                      VALUES(?,?,?,?,?,?,?)""", (batch_id, batch["revision"], decision, rationale, exception_code or None, actor, now()))
             updated = self.conn.execute("UPDATE batches SET state=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?",
                                         (new_state, now(), batch_id, expected_revision))
             if updated.rowcount != 1: raise ApiError(409, "并发放行冲突")
+            self._refresh_review(batch_id)
             self.store.audit(actor, "batch.decision", "batch", batch_id, {"decision": decision, "revision": batch["revision"], "state": new_state, "exception_code": exception_code})
         return {"decision": dict(self._row("decisions", cur.lastrowid)), "batch": self.batch_detail(batch_id)["batch"]}
 
     def _advance_batch(self, batch_id: int, expected_revision: int, next_state: str) -> None:
         batch = self._row("batches", batch_id)
-        if batch["state"] in {"released", "rejected"}: raise ApiError(409, "终态批次不可修改")
+        if batch["state"] in TERMINAL_STATES: raise ApiError(409, "终态批次不可修改")
         if int(expected_revision) != int(batch["revision"]): raise ApiError(409, "批次版本冲突")
         cur = self.conn.execute("UPDATE batches SET state=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?",
                                 (next_state, now(), batch_id, expected_revision))
         if cur.rowcount != 1: raise ApiError(409, "并发更新冲突")
+        self._refresh_review(batch_id)
+
+    # ---- 查询 ----
 
     def batch_detail(self, batch_id: int) -> dict:
         batch = self._batch_dict(self._row("batches", batch_id))
-        def rows(name: str) -> list[dict]: return [dict(row) for row in self.conn.execute(f"SELECT * FROM {name} WHERE batch_id=? ORDER BY id", (batch_id,))]
-        return {"batch": batch, "deviations": rows("deviations"), "tests": rows("tests"), "rework": rows("rework"),
-                "supplier_changes": rows("supplier_changes"), "stability": rows("stability"),
-                "decisions": rows("decisions")}
+        return {"batch": batch, **self._records(batch_id),
+                "decisions": [dict(row) for row in self.conn.execute("SELECT * FROM decisions WHERE batch_id=? ORDER BY id", (batch_id,))],
+                "review": self._current_review(batch_id),
+                "reviews": [dict(row) for row in self.conn.execute("SELECT * FROM reviews WHERE batch_id=? ORDER BY id DESC", (batch_id,))]}
 
     def _batch_dict(self, row: sqlite3.Row) -> dict:
         return {"id": row["id"], "factory_id": row["factory_id"], "batch_no": row["batch_no"], "product": row["product"],
@@ -308,13 +366,58 @@ class BatchService:
                 "spec_min": row["spec_min"], "spec_max": row["spec_max"], "passed": bool(row["passed"]), "round": row["round"]}
 
     def state(self) -> dict:
+        batches = []
+        for row in self.conn.execute("SELECT * FROM batches ORDER BY id DESC"):
+            batch = self._batch_dict(row)
+            review = self._current_review(batch["id"])
+            batch["review"] = {"outcome": review["outcome"], "counts": review["counts"], "missing": review["missing"],
+                               "can_release": review["can_release"], "can_conditional": review["can_conditional"]}
+            batches.append(batch)
         return {"factories": [dict(row) for row in self.conn.execute("SELECT * FROM factories ORDER BY id")],
-                "batches": [self._batch_dict(row) for row in self.conn.execute("SELECT * FROM batches ORDER BY id DESC")],
+                "batches": batches,
                 "audits": [dict(row) for row in self.conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 30")]}
 
     def seed(self) -> None:
-        if not self.conn.execute("SELECT id FROM factories LIMIT 1").fetchone():
-            self.register_factory("qa-demo", "qa", "F-DEMO", "演示工厂", "CN")
+        if self.conn.execute("SELECT id FROM factories LIMIT 1").fetchone():
+            return
+        fid = self.register_factory("qa-demo", "qa", "F-DEMO", "演示工厂", "CN")["id"]
+        future = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+        def rev(batch_id: int) -> int:
+            return self.batch_detail(batch_id)["batch"]["revision"]
+
+        def batch(no: str, product: str) -> int:
+            return self.create_batch("op-demo", "operator", fid, no, product, "2026-03-01", "2028-03-01")["id"]
+
+        # B-1001：资料齐全，可放行
+        b = batch("B-1001", "复方片剂")
+        self.record_test("lab-demo", "lab", fid, b, "含量", 99.5, 95, 105, rev(b))
+        self.record_test("lab-demo", "lab", fid, b, "溶出度", 92, 80, 100, rev(b))
+        self.record_stability("lab-demo", "lab", fid, b, "25C/60RH", "3m", 99.1, 105, rev(b))
+
+        # B-1002：关键偏差未关闭，卡住
+        b = batch("B-1002", "无菌注射液")
+        self.record_test("lab-demo", "lab", fid, b, "含量", 98.2, 95, 105, rev(b))
+        self.record_stability("lab-demo", "lab", fid, b, "25C/60RH", "3m", 98.0, 105, rev(b))
+        self.add_deviation("op-demo", "operator", fid, b, "critical", "无菌保障数据异常", future, rev(b))
+
+        # B-1003：一般偏差有有效例外，可有条件放行
+        b = batch("B-1003", "硬胶囊")
+        self.record_test("lab-demo", "lab", fid, b, "含量", 100.1, 95, 105, rev(b))
+        self.record_stability("lab-demo", "lab", fid, b, "25C/60RH", "3m", 99.8, 105, rev(b))
+        dev = self.add_deviation("op-demo", "operator", fid, b, "minor", "装量轻微偏离", future, rev(b))
+        self.approve_exception("qa-demo", "qa", dev["id"], "偏差影响评估可接受，限期放行", future, rev(b))
+
+        # B-1004：最新检验不合格且返工未完成
+        b = batch("B-1004", "颗粒剂")
+        self.record_test("lab-demo", "lab", fid, b, "含量", 88.0, 95, 105, rev(b))
+        self.record_stability("lab-demo", "lab", fid, b, "25C/60RH", "3m", 97.5, 105, rev(b))
+        self.plan_rework("op-demo", "operator", fid, b, "重新混合后压片", rev(b))
+
+        # B-1005：供应商变更未做影响处置，且缺稳定性数据
+        b = batch("B-1005", "口服液")
+        self.record_test("lab-demo", "lab", fid, b, "pH值", 6.4, 5.5, 7.0, rev(b))
+        self.record_supplier_change("qa-demo", "qa", fid, b, "原辅料供应商A", "产地变更", "原料药产地由山东变更为江苏", rev(b))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -354,6 +457,7 @@ class Handler(BaseHTTPRequestHandler):
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "rework": out = self.service.plan_rework(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("description", ""), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "rework"] and p[3] == "complete": out = self.service.complete_rework(actor, role, int(b.get("factory_id", 0)), int(p[2]), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "supplier-changes": out = self.service.record_supplier_change(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("supplier", ""), b.get("change_type", ""), b.get("description", ""), int(b.get("expected_revision", -1)))
+            elif len(p) == 4 and p[:2] == ["api", "supplier-changes"] and p[3] == "disposition": out = self.service.disposition_supplier_change(actor, role, int(p[2]), b.get("disposition", ""), b.get("note", ""), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "stability": out = self.service.record_stability(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("condition", ""), b.get("timepoint", ""), float(b.get("result", 0)), float(b.get("spec_limit", 0)), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "decide": out = self.service.decide(actor, role, int(p[2]), b.get("decision", ""), b.get("rationale", ""), int(b.get("expected_revision", -1)), b.get("exception_code", ""))
             else: raise ApiError(404, "接口不存在")

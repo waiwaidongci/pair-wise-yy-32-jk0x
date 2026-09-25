@@ -1,1 +1,147 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>批次放行</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>药品生产偏差与批次放行</h1><p>偏差、检验、返工、供应商变更和稳定性数据共同约束质量放行。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>批次放行复核台</title>
+<style>
+:root{--ok:#0a7d3b;--pend:#9a6a00;--bad:#b3261e;--cond:#6a4fb3;--line:#e3e6ea;--muted:#667085}
+*{box-sizing:border-box}
+body{font:15px/1.5 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;max-width:1180px;margin:28px auto;padding:0 20px;color:#1d2939}
+h1{font-size:22px;margin:0 0 4px}
+.muted{color:var(--muted)}
+.toolbar{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin:16px 0;padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:#fafbfc}
+button{padding:6px 14px;border:1px solid #cfd4dc;border-radius:8px;background:#fff;cursor:pointer}
+button:hover{background:#f2f4f7}
+select{padding:5px 8px;border:1px solid #cfd4dc;border-radius:8px;background:#fff}
+table{width:100%;border-collapse:collapse}
+th,td{padding:9px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{font-size:13px;color:var(--muted);font-weight:600}
+tr.batch{cursor:pointer}
+tr.batch:hover{background:#f8fafc}
+tr.batch.open>td{border-bottom:none}
+.badge{display:inline-block;padding:2px 10px;border-radius:999px;font-size:13px;white-space:nowrap}
+.badge.ok{background:#e7f6ec;color:var(--ok)}
+.badge.pend{background:#fdf3e0;color:var(--pend)}
+.badge.bad{background:#fdecea;color:var(--bad)}
+.badge.cond{background:#f0ebfb;color:var(--cond)}
+.badge.grey{background:#eef1f4;color:#475467}
+.counts{font-size:13px;color:var(--muted)}
+.counts b{color:var(--bad)}
+.detail-row td{background:#fbfcfe;padding:14px 18px}
+.cats{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px 22px;margin:8px 0 4px}
+.cat h5{margin:0 0 4px;font-size:13px;color:var(--muted)}
+.cat ul{margin:0;padding-left:2px;list-style:none}
+.cat li{padding:3px 0;font-size:14px}
+li.ok{color:var(--ok)} li.pending{color:var(--pend)} li.blocker{color:var(--bad);font-weight:600} li.conditional{color:var(--cond)}
+.mini{font-size:13px;margin:6px 0 14px;width:auto}
+.mini th,.mini td{padding:5px 10px}
+h4{margin:14px 0 4px;font-size:14px}
+.chev{display:inline-block;transition:transform .15s;color:var(--muted)}
+tr.batch.open .chev{transform:rotate(90deg)}
+</style>
+</head>
+<body>
+<h1>批次放行复核台</h1>
+<p class="muted">每批一张待办：未关闭偏差 · 最新检验 · 稳定性 · 供应商变更 · 返工。资料一改，原复核失效并按新版本重算，旧结论仍可查。</p>
+<div class="toolbar">
+  <label><input type="checkbox" id="onlyBlocked"> 只看卡住的批次</label>
+  <label>结论 <select id="outcomeFilter">
+    <option value="">全部</option>
+    <option value="blocked">卡住</option>
+    <option value="pending">待补齐</option>
+    <option value="conditional">可有条件放行</option>
+    <option value="releasable">可放行</option>
+  </select></label>
+  <label>工厂 <select id="factoryFilter"><option value="">全部</option></select></label>
+  <button id="refresh">刷新</button>
+  <span class="muted" id="summary"></span>
+</div>
+<table>
+<thead><tr><th></th><th>批号</th><th>产品</th><th>工厂</th><th>批次状态</th><th>复核结论</th><th>缺项</th><th>版本</th></tr></thead>
+<tbody id="rows"></tbody>
+</table>
+<p class="muted" id="empty" style="display:none">没有符合筛选条件的批次。</p>
+<script>
+const OUTCOME={releasable:["可放行","ok"],conditional:["可有条件放行","cond"],pending:["待补齐","pend"],blocked:["卡住","bad"]};
+const STATE={manufactured:"已生产",investigation:"调查中",awaiting_resample:"待复测",conditional:"有条件放行",released:"已放行",rejected:"已拒收"};
+const ICON={ok:"✓",pending:"◷",blocker:"✕",conditional:"◐"};
+const CATS=["检验","偏差","稳定性","供应商变更","返工"];
+let state={factories:[],batches:[]};
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const badge=o=>{const[t,c]=OUTCOME[o]||[o,"grey"];return `<span class="badge ${c}">${esc(t)}</span>`};
+const factoryName=id=>{const f=state.factories.find(f=>f.id===id);return f?esc(f.name):esc(id)};
+async function api(p){const r=await fetch(p);const d=await r.json();if(!r.ok)throw new Error(d.error||r.status);return d}
+async function load(){
+  state=await api('/api/state');
+  const sel=$('#factoryFilter'),cur=sel.value;
+  sel.innerHTML='<option value="">全部</option>'+state.factories.map(f=>`<option value="${f.id}">${esc(f.name)}</option>`).join('');
+  sel.value=cur;
+  render();
+}
+function render(){
+  const onlyBlocked=$('#onlyBlocked').checked,fo=$('#outcomeFilter').value,ff=$('#factoryFilter').value;
+  const list=state.batches.filter(b=>{
+    const o=b.review?b.review.outcome:null;
+    if(onlyBlocked&&!(o==='blocked'||o==='pending'))return false;
+    if(fo&&o!==fo)return false;
+    if(ff&&String(b.factory_id)!==ff)return false;
+    return true;
+  });
+  $('#summary').textContent=`共 ${list.length} 批 / 全部 ${state.batches.length} 批`;
+  $('#empty').style.display=list.length?'none':'';
+  $('#rows').innerHTML=list.map(b=>{
+    const r=b.review||{counts:{}};
+    const parts=[];
+    if(r.counts.blocker)parts.push(`<b>阻塞 ${r.counts.blocker}</b>`);
+    if(r.counts.pending)parts.push(`待补 ${r.counts.pending}`);
+    if(r.counts.conditional)parts.push(`例外 ${r.counts.conditional}`);
+    return `<tr class="batch" data-id="${b.id}"><td><span class="chev">▶</span></td>`+
+      `<td>${esc(b.batch_no)}</td><td>${esc(b.product)}</td><td>${factoryName(b.factory_id)}</td>`+
+      `<td>${esc(STATE[b.state]||b.state)}</td><td>${badge(r.outcome)}</td>`+
+      `<td class="counts">${parts.join(' · ')||'—'}</td><td>v${b.revision}</td></tr>`+
+      `<tr class="detail-row" id="detail-${b.id}" style="display:none"><td></td><td colspan="7">加载中…</td></tr>`;
+  }).join('');
+  document.querySelectorAll('tr.batch').forEach(tr=>tr.onclick=()=>toggle(tr));
+}
+async function toggle(tr){
+  const id=tr.dataset.id,row=document.getElementById('detail-'+id);
+  if(row.style.display!=='none'){row.style.display='none';tr.classList.remove('open');return}
+  tr.classList.add('open');row.style.display='';
+  if(!row.dataset.loaded){
+    try{const d=await api('/api/batches/'+id);row.lastElementChild.innerHTML=detailHtml(d);row.dataset.loaded=1}
+    catch(e){row.lastElementChild.innerHTML='加载失败：'+esc(e.message)}
+  }
+}
+function detailHtml(d){
+  const items=(d.review&&d.review.items)||[];
+  let h=`<h4>待办清单（版本 v${d.batch.revision}） ${badge(d.review&&d.review.outcome)}</h4><div class="cats">`;
+  for(const c of CATS){
+    const its=items.filter(i=>i.category===c);if(!its.length)continue;
+    h+=`<div class="cat"><h5>${c}</h5><ul>`+its.map(i=>
+      `<li class="${i.status}">${ICON[i.status]||''} ${esc(i.label)}${i.detail?` <span class="muted">${esc(i.detail)}</span>`:''}</li>`).join('')+`</ul></div>`;
+  }
+  h+='</div>';
+  h+=`<h4>复核历史（资料变更后原结论失效，旧结论仍可查）</h4><table class="mini"><thead><tr><th>版本</th><th>结论</th><th>计算时间</th><th>状态</th></tr></thead><tbody>`+
+    (d.reviews||[]).map(r=>`<tr><td>v${r.revision}</td><td>${badge(r.outcome)}</td><td>${esc(r.created_at)}</td>`+
+      `<td>${r.superseded?'<span class="badge grey">已失效</span>':'<span class="badge ok">当前</span>'}</td></tr>`).join('')+`</tbody></table>`;
+  if(d.decisions&&d.decisions.length){
+    const last=d.decisions[d.decisions.length-1];
+    h+=`<h4>放行决定</h4><table class="mini"><thead><tr><th>决定</th><th>依据</th><th>例外编号</th><th>决定人</th><th>基于版本</th><th>状态</th></tr></thead><tbody>`+
+      d.decisions.map(x=>{
+        const cur=x===last&&x.revision+1===d.batch.revision;
+        return `<tr><td>${esc(x.decision)}</td><td>${esc(x.rationale)}</td><td>${esc(x.exception_code||'—')}</td><td>${esc(x.decided_by)}</td><td>v${x.revision}</td>`+
+          `<td>${cur?'<span class="badge ok">当前</span>':'<span class="badge grey">已失效</span>'}</td></tr>`;
+      }).join('')+`</tbody></table>`;
+  }
+  return h;
+}
+$('#refresh').onclick=load;
+$('#onlyBlocked').onchange=render;
+$('#outcomeFilter').onchange=render;
+$('#factoryFilter').onchange=render;
+load().catch(e=>{$('#rows').innerHTML=`<tr><td colspan="8">加载失败：${esc(e.message)}</td></tr>`});
+</script>
+</body>
+</html>
